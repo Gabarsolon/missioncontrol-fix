@@ -26,25 +26,12 @@ class MissionControlDoctor {
     private let cid = CGSMainConnectionID()
     private let spacesApp = "com.apple.spaces" as CFString
     private let configKey = "SpacesDisplayConfiguration" as CFString
-    private var lastRunTime: Date = Date.distantPast
-    private var fileWatcher: DispatchSourceFileSystemObject?
-    private var fileDescriptor: Int32 = -1
+    private var lastRestartTime: Date = Date.distantPast
+    private var isRepairing = false
 
-    // Returns a mapping of hardware display ID to UUID string
-    func getOnlineDisplayMap() -> [CGDirectDisplayID: String] {
-        var count: UInt32 = 0
-        CGGetOnlineDisplayList(0, nil, &count)
-        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
-        CGGetOnlineDisplayList(count, &displays, &count)
-
-        var map = [CGDirectDisplayID: String]()
-        for d in displays {
-            if let uuidRef = CGDisplayCreateUUIDFromDisplayID(d)?.takeRetainedValue() {
-                let uuidStr = CFUUIDCreateString(nil, uuidRef) as String
-                map[d] = uuidStr
-            }
-        }
-        return map
+    init() {
+        setlinebuf(stdout)
+        setlinebuf(stderr)
     }
 
     // Resolves "Main" identifier to the actual primary display UUID
@@ -56,6 +43,61 @@ class MissionControlDoctor {
         return nil
     }
 
+    // Returns a list of display UUIDs whose desktop backing layer is unrendered / pitch black
+    func detectBlackDisplays() -> [(id: CGDirectDisplayID, uuid: String, bounds: CGRect)] {
+        guard let rawSpaces = SLSCopyManagedDisplaySpaces(cid)?.takeRetainedValue() as? [[String: Any]] else {
+            return []
+        }
+
+        var count: UInt32 = 0
+        CGGetOnlineDisplayList(0, nil, &count)
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        CGGetOnlineDisplayList(count, &displays, &count)
+
+        var displayInfo = [String: (id: CGDirectDisplayID, bounds: CGRect)]()
+        for d in displays {
+            if let uuidRef = CGDisplayCreateUUIDFromDisplayID(d)?.takeRetainedValue() {
+                let uuidStr = CFUUIDCreateString(nil, uuidRef) as String
+                displayInfo[uuidStr] = (d, CGDisplayBounds(d))
+            }
+        }
+
+        let windowList = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+
+        var blackDisplays = [(id: CGDirectDisplayID, uuid: String, bounds: CGRect)]()
+
+        for d in rawSpaces {
+            guard let uuid = d["Display Identifier"] as? String,
+                  let info = displayInfo[uuid] else { continue }
+
+            let cur = d["Current Space"] as? [String: Any]
+            let spaceType = (cur?["type"] as? NSNumber)?.int32Value ?? 0
+
+            // If the active space is a Desktop space (type 0)
+            if spaceType == 0 {
+                var foundOnScreen = false
+                for w in windowList {
+                    guard let owner = w[kCGWindowOwnerName as String] as? String, owner == "Finder",
+                          let layer = w[kCGWindowLayer as String] as? Int, layer == -2147483603,
+                          let bDict = w[kCGWindowBounds as String] as? [String: Any],
+                          let wBounds = CGRect(dictionaryRepresentation: bDict as CFDictionary) else { continue }
+
+                    if wBounds.equalTo(info.bounds) {
+                        if let onScreen = w[kCGWindowIsOnscreen as String] as? Bool, onScreen {
+                            foundOnScreen = true
+                        }
+                        break
+                    }
+                }
+
+                if !foundOnScreen {
+                    blackDisplays.append((id: info.id, uuid: uuid, bounds: info.bounds))
+                }
+            }
+        }
+        return blackDisplays
+    }
+
     // MARK: - Health Check
     func checkHealth(verbose: Bool = true) -> Bool {
         var isHealthy = true
@@ -65,19 +107,21 @@ class MissionControlDoctor {
             print("==================================================")
         }
 
-        // 1. Check Live Display Spaces from SkyLight
         guard let rawSpaces = SLSCopyManagedDisplaySpaces(cid)?.takeRetainedValue() as? [[String: Any]] else {
             print("❌ Error: Unable to query SkyLight display spaces.")
             return false
         }
 
         let mainUUID = getMainDisplayUUID()
+        let blackDisplays = detectBlackDisplays()
+        let blackUUIDs = Set(blackDisplays.map { $0.uuid })
 
         for (idx, d) in rawSpaces.enumerated() {
             let uuidStr = d["Display Identifier"] as? String ?? "Unknown"
             let isMain = (uuidStr == mainUUID)
             let curSpaceDict = d["Current Space"] as? [String: Any]
             let curSpaceID = (curSpaceDict?["ManagedSpaceID"] as? NSNumber)?.uint64Value ?? 0
+            let spaceType = (curSpaceDict?["type"] as? NSNumber)?.int32Value ?? 0
             let spaces = d["Spaces"] as? [[String: Any]] ?? []
 
             var validIDs = Set<UInt64>()
@@ -89,21 +133,24 @@ class MissionControlDoctor {
 
             if verbose {
                 print("\n[Display \(idx)] UUID: \(uuidStr)\(isMain ? " (Main Display)" : " (External)")")
-                print("  • Active Space ID: \(curSpaceID)")
+                print("  • Active Space ID: \(curSpaceID) (\(spaceType == 0 ? "Desktop" : "Full-Screen App"))")
                 print("  • Total Registered Spaces: \(spaces.count)")
             }
 
             if !validIDs.contains(curSpaceID) {
-                print("  ⚠️  WARNING: Active Space \(curSpaceID) is NOT in this display's spaces list! (Ghost Space)")
+                print("  ⚠️  WARNING: Active Space \(curSpaceID) is NOT in this display's spaces list!")
                 isHealthy = false
-            } else {
-                if verbose {
-                    print("  ✓ Active Space is valid.")
-                }
+            }
+
+            if blackUUIDs.contains(uuidStr) {
+                print("  ❌ STATUS: SCREEN IS BLACK! Desktop backing layer is unrendered (onScreen = false).")
+                isHealthy = false
+            } else if verbose {
+                print("  ✓ Desktop compositor layer is visible and active.")
             }
         }
 
-        // 2. Check com.apple.spaces Plist Preferences
+        // Check com.apple.spaces Plist Preferences
         if let dict = CFPreferencesCopyAppValue(configKey, spacesApp) as? [String: Any],
            let mgmt = dict["Management Data"] as? [String: Any] {
 
@@ -123,19 +170,17 @@ class MissionControlDoctor {
             }
 
             if let sa = mgmt["SpaceAssignments"] as? [String: Any] {
-                // Check ManagedSpaceAssignments
                 if let assignments = sa["ManagedSpaceAssignments"] as? [[String: Any]] {
                     for a in assignments {
                         let sid = a["ManagedSpaceID"] as? String ?? ""
                         let dids = a["ManagedDisplayID"] as? [String] ?? []
                         if dids.count > 1 {
-                            print("\n⚠️  CORRUPTION DETECTED: Space '\(sid)' is assigned to multiple displays simultaneously: \(dids)")
+                            print("\n⚠️  CORRUPTION: Space '\(sid)' assigned to multiple displays: \(dids)")
                             isHealthy = false
                         }
                     }
                 }
 
-                // Check ManagedSpaceOrdering
                 if let ordering = sa["ManagedSpaceOrdering"] as? [[String: Any]] {
                     for entry in ordering {
                         let did = entry["ManagedDisplayID"] as? String ?? ""
@@ -143,7 +188,7 @@ class MissionControlDoctor {
                         let sids = entry["ManagedSpaceIDs"] as? [String] ?? []
                         for sid in sids where !sid.isEmpty {
                             if let owner = spaceOwnerMap[sid], owner != realDid {
-                                print("\n⚠️  CORRUPTION DETECTED: Space '\(sid)' in ordering for display '\(did)' actually belongs to '\(owner)'!")
+                                print("\n⚠️  CORRUPTION: Space '\(sid)' in ordering for display '\(did)' actually belongs to '\(owner)'!")
                                 isHealthy = false
                             }
                         }
@@ -152,7 +197,7 @@ class MissionControlDoctor {
             }
         }
 
-        // 3. Check mru-spaces
+        // Check mru-spaces
         let mru = CFPreferencesCopyAppValue("mru-spaces" as CFString, "com.apple.dock" as CFString) as? Bool
         if verbose {
             print("\n--------------------------------------------------")
@@ -167,14 +212,14 @@ class MissionControlDoctor {
             }
         } else {
             if verbose {
-                print("\n❌ Desynchronization or corruption detected. Run 'missioncontrol-fix repair' to fix.")
+                print("\n❌ Issues detected. Run 'missioncontrol-fix repair' to restore.")
             }
         }
 
         return isHealthy
     }
 
-    // MARK: - Repair Corrupted Spaces Preferences
+    // MARK: - Preferences Cleanup
     @discardableResult
     func repairPreferences() -> Bool {
         guard var dict = CFPreferencesCopyAppValue(configKey, spacesApp) as? [String: Any],
@@ -200,7 +245,6 @@ class MissionControlDoctor {
 
         var modified = false
 
-        // 1. Clean ManagedSpaceAssignments
         if let assignments = sa["ManagedSpaceAssignments"] as? [[String: Any]] {
             var cleanedAssignments = [[String: Any]]()
             for a in assignments {
@@ -219,7 +263,6 @@ class MissionControlDoctor {
             }
         }
 
-        // 2. Clean ManagedSpaceOrdering
         if let ordering = sa["ManagedSpaceOrdering"] as? [[String: Any]] {
             var cleanedOrdering = [[String: Any]]()
             for entry in ordering {
@@ -254,94 +297,87 @@ class MissionControlDoctor {
             dict["Management Data"] = mgmt
             CFPreferencesSetAppValue(configKey, dict as CFDictionary, spacesApp)
             CFPreferencesAppSynchronize(spacesApp)
-            print("[Doctor] Fixed corrupted duplicate entries in com.apple.spaces.")
+            print("[Doctor] Purged corrupted duplicate entries in com.apple.spaces.")
         }
 
         return modified
     }
 
-    // MARK: - Re-assert and Un-blank Displays
-    @discardableResult
-    func repairDisplays(silent: Bool = false) -> Int {
-        guard let rawSpaces = SLSCopyManagedDisplaySpaces(cid)?.takeRetainedValue() as? [[String: Any]] else {
-            return 0
+    // MARK: - Reload Dock Compositor
+    func reloadDock(reason: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastRestartTime) > 2.0 else { return }
+        lastRestartTime = now
+
+        print("[Doctor] 🔄 \(reason) -> Reloading Dock compositor...")
+        for app in NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock") {
+            kill(app.processIdentifier, SIGTERM)
         }
-
-        var fixedCount = 0
-
-        for d in rawSpaces {
-            guard let uuidStr = d["Display Identifier"] as? String else { continue }
-            let uuid = uuidStr as CFString
-            let curSpaceDict = d["Current Space"] as? [String: Any]
-            var curSpaceID = (curSpaceDict?["ManagedSpaceID"] as? NSNumber)?.uint64Value ?? 0
-            let spaces = d["Spaces"] as? [[String: Any]] ?? []
-
-            var validIDs = [UInt64]()
-            var desktopSpaceID: UInt64 = 0
-
-            for s in spaces {
-                if let sid = (s["ManagedSpaceID"] as? NSNumber)?.uint64Value {
-                    validIDs.append(sid)
-                    let stype = (s["type"] as? NSNumber)?.int32Value ?? 0
-                    if stype == 0 && desktopSpaceID == 0 {
-                        desktopSpaceID = sid
-                    }
-                }
-            }
-
-            var needsCorrection = false
-
-            // If current space is orphaned (not in display's spaces)
-            if !validIDs.contains(curSpaceID) {
-                needsCorrection = true
-                if desktopSpaceID != 0 {
-                    curSpaceID = desktopSpaceID
-                } else if let first = validIDs.first {
-                    curSpaceID = first
-                }
-            }
-
-            // Always re-assert space layer to ensure WindowServer de-occludes the desktop
-            SLSManagedDisplaySetCurrentSpace(cid, uuid, curSpaceID)
-            SLSShowSpaces(cid, [curSpaceID] as CFArray)
-
-            if needsCorrection {
-                fixedCount += 1
-                if !silent {
-                    print("[Doctor] Restored orphaned display '\(uuidStr)' to Space ID \(curSpaceID).")
-                }
-            }
-        }
-
-        return fixedCount
     }
 
-    // MARK: - Full Repair Routine
+    // MARK: - Check and Auto-Unblank
+    @discardableResult
+    func checkAndUnblank(silent: Bool = false) -> Bool {
+        guard !isRepairing else { return false }
+        isRepairing = true
+        defer { isRepairing = false }
+
+        // 1. Clean preferences if corrupted
+        repairPreferences()
+
+        // 2. Check for black displays
+        let blackDisplays = detectBlackDisplays()
+        if !blackDisplays.isEmpty {
+            let desc = blackDisplays.map { "\($0.uuid)" }.joined(separator: ", ")
+            if !silent {
+                print("[Doctor] ⚠️ Detected BLACK SCREEN on display(s): \(desc)")
+            }
+
+            // Reload Dock to immediately re-bind the wallpaper and Finder desktop windows
+            reloadDock(reason: "Black screen detected on [\(desc)]")
+            return true
+        }
+
+        return false
+    }
+
+    // MARK: - Full Manual Repair Routine
     func fullRepair() {
-        print("[Doctor] Starting Mission Control / Spaces repair...")
-        let prefRepaired = repairPreferences()
-        let displaysRepaired = repairDisplays(silent: false)
+        print("[Doctor] Starting manual Mission Control / Spaces repair...")
+        repairPreferences()
 
         // Ensure mru-spaces is disabled
         CFPreferencesSetAppValue("mru-spaces" as CFString, kCFBooleanFalse, "com.apple.dock" as CFString)
         CFPreferencesAppSynchronize("com.apple.dock" as CFString)
 
-        print("[Doctor] Mission Control preferences optimized (mru-spaces = false).")
-        print("[Doctor] Display compositing layers refreshed.")
-        if prefRepaired || displaysRepaired > 0 {
-            print("✅ Successfully repaired all orphaned spaces and display configurations!")
+        let blackDisplays = detectBlackDisplays()
+        if !blackDisplays.isEmpty {
+            let desc = blackDisplays.map { "\($0.uuid)" }.joined(separator: ", ")
+            print("[Doctor] Detected black display(s): \(desc)")
+            reloadDock(reason: "Manual repair request")
+            print("✅ Dock restarted. Displays restored!")
         } else {
-            print("✅ All displays refreshed and verified healthy (no active corruptions).")
+            // Re-assert spaces via SkyLight
+            guard let rawSpaces = SLSCopyManagedDisplaySpaces(cid)?.takeRetainedValue() as? [[String: Any]] else { return }
+            for d in rawSpaces {
+                guard let uuidStr = d["Display Identifier"] as? String else { continue }
+                let cur = d["Current Space"] as? [String: Any]
+                if let sid = (cur?["ManagedSpaceID"] as? NSNumber)?.uint64Value {
+                    SLSManagedDisplaySetCurrentSpace(cid, uuidStr as CFString, sid)
+                    SLSShowSpaces(cid, [sid] as CFArray)
+                }
+            }
+            print("✅ All displays verified healthy (no black screens detected).")
         }
     }
 
     // MARK: - Daemon Watcher Mode
     func startDaemon() {
-        print("[Doctor Daemon] Starting background watcher for macOS 27 Mission Control bug...")
+        print("[Doctor Daemon] Starting background watchdog for macOS 27 Mission Control bug...")
+        print("[Doctor Daemon] Monitoring display layers and space changes...")
 
         // Initial sweep
-        repairPreferences()
-        repairDisplays(silent: true)
+        checkAndUnblank(silent: true)
 
         let center = NSWorkspace.shared.notificationCenter
 
@@ -351,7 +387,9 @@ class MissionControlDoctor {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.handleEvent(reason: "ActiveSpaceDidChange")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                self?.checkAndUnblank(silent: false)
+            }
         }
 
         // 2. Observe Display Reconfigurations
@@ -360,51 +398,18 @@ class MissionControlDoctor {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.handleEvent(reason: "ScreenParametersChanged")
-        }
-
-        // 3. Watch com.apple.spaces.plist modifications
-        startPlistWatcher()
-
-        print("[Doctor Daemon] Active and monitoring. Press Ctrl+C to stop.")
-        RunLoop.current.run()
-    }
-
-    private func handleEvent(reason: String) {
-        // Debounce within 200ms
-        let now = Date()
-        guard now.timeIntervalSince(lastRunTime) > 0.2 else { return }
-        lastRunTime = now
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self = self else { return }
-            self.repairPreferences()
-            self.repairDisplays(silent: true)
-        }
-    }
-
-    private func startPlistWatcher() {
-        let plistPath = ("~/Library/Preferences/com.apple.spaces.plist" as NSString).expandingTildeInPath
-        fileDescriptor = open(plistPath, O_EVTONLY)
-        guard fileDescriptor >= 0 else { return }
-
-        fileWatcher = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fileDescriptor,
-            eventMask: [.write, .extend, .attrib],
-            queue: .main
-        )
-
-        fileWatcher?.setEventHandler { [weak self] in
-            self?.handleEvent(reason: "SpacesPlistModified")
-        }
-
-        fileWatcher?.setCancelHandler { [weak self] in
-            if let fd = self?.fileDescriptor, fd >= 0 {
-                close(fd)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self?.checkAndUnblank(silent: false)
             }
         }
 
-        fileWatcher?.resume()
+        // 3. Periodic liveness timer (checks every 1.5 seconds with ~0% CPU)
+        Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.checkAndUnblank(silent: true)
+        }
+
+        print("[Doctor Daemon] Active and monitoring. Press Ctrl+C to stop.")
+        RunLoop.current.run()
     }
 }
 
@@ -429,8 +434,8 @@ case "help", "--help", "-h":
     missioncontrol-fix: macOS 27 Mission Control Multi-Monitor Black Screen Fix
     
     Usage:
-      missioncontrol-fix status     Check spaces and display health for corruptions
-      missioncontrol-fix repair     Instantly un-blank displays and repair spaces
+      missioncontrol-fix status     Check displays and detect unrendered/black screens
+      missioncontrol-fix repair     Instantly restore black screens and heal spaces
       missioncontrol-fix daemon     Run background watchdog (auto-fixes in real time)
       missioncontrol-fix help       Show this help message
     """)
